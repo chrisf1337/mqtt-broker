@@ -1,0 +1,11 @@
+[[package]]
+name = "libmqtt"
+version = "0.1.0"
+
+[[package]]
+name = "mqtt-broker"
+version = "0.1.0"
+dependencies = [
+ "libmqtt 0.1.0",
+]
+
