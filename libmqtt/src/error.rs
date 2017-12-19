@@ -17,6 +17,9 @@ pub enum Error {
     IdRejected,
     InvalidWillRetain,
     Unimplemented,
+
+    CloseNetworkConn,
+
     Io(io::Error)
 }
 

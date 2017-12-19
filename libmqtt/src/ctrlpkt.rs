@@ -1,9 +1,10 @@
 use std::net::TcpStream;
-use std::io::{Read};
+use std::io::{Read, Write};
 use std::slice::Iter;
 use std::iter::Iterator;
 use error::{Result, Error};
 use uuid::Uuid;
+use self::CtrlPkt::*;
 
 pub const MAX_PAYLOAD_SIZE: usize = 268435455;
 
@@ -16,6 +17,22 @@ bitflags! {
         const WILL_FLAG     = 0b00000100;
         const CLEAN_SESSION = 0b00000010;
     }
+}
+
+bitflags! {
+    pub struct ConnAckFlags: u8 {
+        const SESSION_PRESENT = 0b00000001;
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum ConnAckRetCode {
+    Accepted = 0,
+    UnacceptableProtocolVer = 1,
+    IdRejected = 2,
+    ServerUnavailable = 3,
+    BadUsernameOrPassword = 4,
+    NotAuthorized = 5
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -47,7 +64,10 @@ pub enum CtrlPkt {
         username: Option<String>,
         password: Option<String>
     },
-    ConnAck,
+    ConnAck {
+        session_present: bool,
+        return_code: ConnAckRetCode
+    },
     Publish,
     PubAck,
     PubRec,
@@ -55,16 +75,16 @@ pub enum CtrlPkt {
     PubComp,
     Subscribe,
     SubAck,
-    Unsubscribe0,
-    UnsubAck1,
-    PingReq2,
-    PingResp3,
-    Disconnect4
+    Unsubscribe,
+    UnsubAck,
+    PingReq,
+    PingResp,
+    Disconnect
 }
 
 impl CtrlPkt {
-    pub fn deserialize(mut stream: TcpStream) -> Result<CtrlPkt> {
-        let (ty, flags) = stream.read_fixed_header()?;
+    pub fn deserialize(stream: &mut TcpStream) -> Result<CtrlPkt> {
+        let (ty, flags) = stream.read_header()?;
         match ty {
             CtrlPktType::Connect => {
                 let len = stream.read_remaining_len()?;
@@ -108,28 +128,76 @@ impl CtrlPkt {
                     connect_flags, keep_alive, client_id, will_topic, will_message,
                     username, password);
 
-                Ok(CtrlPkt::Connect {
-                    connect_flags: connect_flags,
-                    keep_alive: keep_alive,
-                    client_id: client_id,
-                    will_topic: will_topic,
-                    will_message: will_message,
-                    username: username,
-                    password: password
+                Ok(Connect {
+                    connect_flags,
+                    keep_alive,
+                    client_id,
+                    will_topic,
+                    will_message,
+                    username,
+                    password
                 })
+            }
+            _ => Err(Error::Unimplemented)
+        }
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let mut buf = vec![];
+        match self {
+            &ConnAck { session_present, return_code } => {
+                buf.write_header(self)?;
+                Ok(buf)
             }
             _ => Err(Error::Unimplemented)
         }
     }
 }
 
-pub trait MqttStream: Read {
-    fn read_fixed_header(&mut self) -> Result<(CtrlPktType, u8)>;
+pub trait MqttWrite: Write {
+    fn write_header(&mut self, pkt: &CtrlPkt) -> Result<()>;
+    fn write_remaining_length(&mut self, len: usize);
+    fn write_u8(&mut self, i: u8) -> Result<()>;
+}
+
+impl MqttWrite for Vec<u8> {
+    fn write_header(&mut self, pkt: &CtrlPkt) -> Result<()> {
+        match pkt {
+            &ConnAck { session_present, return_code } => {
+                self.write_u8((CtrlPktType::ConnAck as u8) << 4)?;
+                self.write_remaining_length(2);
+                self.write_u8(session_present as u8)?;
+                self.write_u8(return_code as u8)
+            }
+            _ => Err(Error::Unimplemented)
+        }
+    }
+
+    fn write_remaining_length(&mut self, mut len: usize) {
+        let mut done = false;
+        while !done {
+            let mut encoded_byte = (len % 128) as u8;
+            len /= 128;
+            if len > 0 {
+                encoded_byte = encoded_byte | 128;
+            }
+            self.write_u8(encoded_byte);
+            done = len == 0;
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) -> Result<()> {
+        Ok(self.write_all(&[i])?)
+    }
+}
+
+pub trait MqttRead: Read {
+    fn read_header(&mut self) -> Result<(CtrlPktType, u8)>;
     fn read_remaining_len(&mut self) -> Result<usize>;
     fn read_len(&mut self, len: usize) -> Result<Vec<u8>>;
 }
 
-pub trait MqttReadStream: Iterator {
+pub trait MqttReadIterator: Iterator {
     fn read_str(&mut self) -> Result<String>;
     fn read_protocol_lv(&mut self) -> Result<u8>;
     fn read_len(&mut self, len: usize) -> Result<Vec<u8>>;
@@ -137,8 +205,8 @@ pub trait MqttReadStream: Iterator {
     fn read_u16(&mut self) -> Result<u16>;
 }
 
-impl MqttStream for TcpStream {
-    fn read_fixed_header(&mut self) -> Result<(CtrlPktType, u8)> {
+impl MqttRead for TcpStream {
+    fn read_header(&mut self) -> Result<(CtrlPktType, u8)> {
         let header = try!(self.read_len(1));
         let ty = try!(match header[0] >> 4 {
             1 => Ok(CtrlPktType::Connect),
@@ -184,7 +252,7 @@ impl MqttStream for TcpStream {
     }
 }
 
-impl<'a> MqttReadStream for Iter<'a, u8> {
+impl<'a> MqttReadIterator for Iter<'a, u8> {
     fn read_str(&mut self) -> Result<String> {
         let len = self.read_u16()? as usize;
         let str_buf = self.read_len(len)?;
