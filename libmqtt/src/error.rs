@@ -14,15 +14,19 @@ pub enum Error {
     MalformedUtf8Str,
     StrTooLong,
     ReadErr,
+    NoSession,
     InvalidProtocol,
     UnacceptableProtocolLv,
     IdRejected,
     InvalidWillRetain,
     InvalidQosLv,
     InvalidFixedHeaderFlags,
+    SubscribeMissingTopicFilters,
+    SubscribeInvalidRequestedQos,
 
     UnimplementedPkt(CtrlPkt),
     UnimplementedPktType(CtrlPktType),
+    Unimplemented(String),
 
     Io(io::Error)
 }

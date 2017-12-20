@@ -12,14 +12,19 @@ use std::io::Write;
 use std::net::{TcpStream, TcpListener};
 use std::thread;
 
+#[derive(Debug, Clone)]
 struct Session {
-    subscriptions: Vec<i32>
+    pub client_id: String,
+    pub subscriptions: Vec<i32>,
+    pub clean_session: bool
 }
 
 impl Session {
-    fn new() -> Session {
+    fn new(client_id: String, clean_session: bool) -> Session {
         Session {
-            subscriptions: vec![]
+            client_id,
+            subscriptions: vec![],
+            clean_session
         }
     }
 }
@@ -33,6 +38,7 @@ fn handle_client(mut stream: TcpStream,
                  sessions: Arc<RwLock<HashMap<String, Session>>>,
                  retained_msgs: Arc<RwLock<HashMap<String, Message>>>,
                  pkt_id_gen: Arc<Mutex<PktIdGen>>) -> Result<()> {
+    let mut session: Option<Session> = None;
     loop {
         match match CtrlPkt::deserialize(&mut stream) {
             Ok(Connect {
@@ -54,9 +60,6 @@ fn handle_client(mut stream: TcpStream,
                     password: password.clone()
                 });
                 let mut sessions = sessions.write().unwrap();
-                if connect_flags.contains(ConnectFlags::CLEAN_SESSION) {
-                    sessions.insert(client_id.clone(), Session::new());
-                }
                 let (session_present, return_code) =
                     if connect_flags.contains(ConnectFlags::CLEAN_SESSION) ||
                         !sessions.contains_key(&client_id) {
@@ -64,6 +67,19 @@ fn handle_client(mut stream: TcpStream,
                         } else {
                             (true, ConnAckRetCode::Accepted)
                         };
+                if connect_flags.contains(ConnectFlags::CLEAN_SESSION) {
+                    // Clear old session
+                    sessions.remove(&client_id);
+                    session = Some(Session::new(client_id,
+                        connect_flags.contains(ConnectFlags::CLEAN_SESSION)));
+                } else {
+                    // Get old session or create a new one
+                    session = match sessions.get(&client_id) {
+                        Some(sess) => Some(sess.clone()),
+                        None => Some(Session::new(client_id,
+                            connect_flags.contains(ConnectFlags::CLEAN_SESSION)))
+                    };
+                }
                 let buf = CtrlPkt::ConnAck { session_present, return_code }.serialize()?;
                 stream.write_all(&buf).and_then(|()| Ok(()))
             }
@@ -76,6 +92,9 @@ fn handle_client(mut stream: TcpStream,
                     pkt_id: pkt_id.clone(),
                     payload: payload.clone()
                 });
+                if session.is_none() {
+                    return Err(Error::NoSession);
+                }
                 if retain {
                     let mut retained_msgs = retained_msgs.write().unwrap();
                     retained_msgs.insert(topic_name.clone(), Message { qos_lv, data: payload });
@@ -90,16 +109,32 @@ fn handle_client(mut stream: TcpStream,
                         .and_then(|()| Ok(()))
                 }
             }
+            Ok(Subscribe { pkt_id, subscriptions }) => {
+                if session.is_none() {
+                    return Err(Error::NoSession);
+                }
+                let session = session.as_ref().unwrap();
+                Ok(())
+            }
             Ok(pkt@PingReq) => {
                 println!("Received {:?}", pkt);
+                if session.is_none() {
+                    return Err(Error::NoSession);
+                }
                 stream.write_all(&(PingResp.serialize()?)).and_then(|()| Ok(()))
             }
             Ok(pkt@Disconnect) => {
                 println!("Received {:?}", pkt);
+                if session.is_none() {
+                    return Err(Error::NoSession);
+                }
                 return Ok(());
             }
             Ok(pkt@_) => {
                 println!("Received {:?}", pkt);
+                if session.is_none() {
+                    return Err(Error::NoSession);
+                }
                 return Err(Error::UnimplementedPkt(pkt))
             }
             Err(e@Error::InvalidProtocol) => {

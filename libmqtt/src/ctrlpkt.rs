@@ -2,11 +2,9 @@ use std::net::TcpStream;
 use std::io::{Read, Write};
 use std::slice::Iter;
 use std::iter::Iterator;
-use std::sync::{Mutex, Arc};
 use std::u16;
 use error::{Result, Error};
 use uuid::Uuid;
-use pktid::PktIdGen;
 use self::CtrlPkt::*;
 
 pub const MAX_PAYLOAD_SIZE: usize = 268435455;
@@ -106,7 +104,7 @@ pub enum CtrlPkt {
     PubRec(u16),
     PubRel,
     PubComp,
-    Subscribe { id: u16, subscriptions: Vec<(String, QosLv)> },
+    Subscribe { pkt_id: u16, subscriptions: Vec<(String, QosLv)> },
     SubAck,
     Unsubscribe,
     UnsubAck,
@@ -162,7 +160,7 @@ impl CtrlPkt {
             CtrlPktType::Publish => {
                 let flags = PublishFlags::from_bits_truncate(flags);
                 let dup = flags.contains(PublishFlags::DUP);
-                let qos_lv = QosLv::from_int((flags | PublishFlags::QOS_LV).bits())?;
+                let qos_lv = QosLv::from_int((flags & PublishFlags::QOS_LV).bits() >> 1)?;
                 let retain = flags.contains(PublishFlags::RETAIN);
                 let (topic_name, len) = iter.read_str_get_len()?;
                 let pkt_id = if qos_lv == QosLv::AtLeastOnce || qos_lv == QosLv::ExactlyOnce {
@@ -178,9 +176,30 @@ impl CtrlPkt {
                 if flags != 0b0010 {
                     return Err(Error::InvalidFixedHeaderFlags);
                 }
-                // TODO: Wildcard topics
                 let pkt_id = iter.read_u16()?;
-                Ok(Subscribe { id: 0, subscriptions: vec![] })
+                // - 2 because of packet id
+                // Error if no topic filters are found
+                if remaining_len <= 2 {
+                    return Err(Error::SubscribeMissingTopicFilters);
+                }
+                let mut subscriptions = vec![];
+                let mut topic_filters_len = 0;
+                while remaining_len - 2 - topic_filters_len > 0 {
+                    let (topic_filter, topic_filter_len) = iter.read_str_get_len()?;
+                    // TODO: Wildcard topics. For now, error if topic filter contains a wildcard
+                    if topic_filter.contains("*") {
+                        return Err(Error::Unimplemented("topic filter wildcards".to_string()));
+                    }
+                    let requested_qos_byte = iter.read_u8()?;
+                    if requested_qos_byte & 0b11111100 > 0 {
+                        return Err(Error::SubscribeInvalidRequestedQos);
+                    }
+                    let requested_qos = QosLv::from_int(requested_qos_byte & 0b11)?;
+                    // + 1 for requested QoS
+                    topic_filters_len += (topic_filter_len as usize) + 1;
+                    subscriptions.push((topic_filter, requested_qos));
+                }
+                Ok(Subscribe { pkt_id, subscriptions })
             }
             CtrlPktType::PingReq => Ok(PingReq),
             CtrlPktType::Disconnect => Ok(Disconnect),
