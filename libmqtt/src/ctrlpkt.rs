@@ -200,6 +200,10 @@ impl CtrlPkt {
                 let payload = iter.read_len(payload_len)?;
                 Ok(Publish { dup, qos_lv, retain, topic_name, pkt_id, payload })
             }
+            CtrlPktType::PubAck => {
+                let pkt_id = iter.read_u16()?;
+                Ok(PubAck(pkt_id))
+            }
             CtrlPktType::Subscribe => {
                 if flags != 0b0010 {
                     return Err(Error::InvalidFixedHeaderFlags);
@@ -233,7 +237,7 @@ impl CtrlPkt {
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = vec![];
-        buf.write_header(self);
+        buf.write_header(self)?;
         match self {
             &ConnAck { session_present, return_code } => {
                 buf.write_remaining_len(2)?;
@@ -311,10 +315,10 @@ impl MqttWrite for Vec<u8> {
                 }
                 self.write_u8(((CtrlPktType::Publish as u8) << 4) + PublishFlags::bits(&low_bits))
             }
-            &PubAck(id) => {
+            &PubAck(..) => {
                 self.write_u8((CtrlPktType::PubAck as u8) << 4)
             }
-            &PubRec(id) => {
+            &PubRec(..) => {
                 self.write_u8((CtrlPktType::PubRec as u8) << 4)
             }
             &SubAck { .. } => {

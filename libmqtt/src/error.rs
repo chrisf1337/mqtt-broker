@@ -23,6 +23,7 @@ pub enum Error {
     InvalidFixedHeaderFlags,
     SubscribeMissingTopicFilters,
     SubscribeInvalidRequestedQos,
+    PublishOutOfPktIds,
 
     UnimplementedPkt(CtrlPkt),
     UnimplementedPktType(CtrlPktType),
