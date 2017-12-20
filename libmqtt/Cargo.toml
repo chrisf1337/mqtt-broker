@@ -6,3 +6,4 @@ authors = ["Christopher Fu <chrisf1337@gmail.com>"]
 [dependencies]
 bitflags = "*"
 uuid = { version = "*", features = ["v4"] }
+rand = "*"

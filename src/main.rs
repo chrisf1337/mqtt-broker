@@ -5,9 +5,9 @@ extern crate netopt;
 
 use netopt::{NetworkOptions};
 use mqttc::{ClientOptions};
-use libmqtt::{ctrlpkt::*, ctrlpkt::CtrlPkt::*, error::*};
+use libmqtt::{ctrlpkt::*, ctrlpkt::CtrlPkt::*, error::*, pktid::*};
 use std::collections::hash_map::HashMap;
-use std::sync::{RwLock, Arc};
+use std::sync::{RwLock, Arc, Mutex};
 use std::io::Write;
 use std::net::{TcpStream, TcpListener};
 use std::thread;
@@ -31,7 +31,8 @@ struct Message {
 
 fn handle_client(mut stream: TcpStream,
                  sessions: Arc<RwLock<HashMap<String, Session>>>,
-                 retained_msgs: Arc<RwLock<HashMap<String, Message>>>) -> Result<()> {
+                 retained_msgs: Arc<RwLock<HashMap<String, Message>>>,
+                 pkt_id_gen: Arc<Mutex<PktIdGen>>) -> Result<()> {
     loop {
         match match CtrlPkt::deserialize(&mut stream) {
             Ok(Connect {
@@ -81,9 +82,11 @@ fn handle_client(mut stream: TcpStream,
                 }
                 match qos_lv {
                     QosLv::AtMostOnce => Ok(()),
-                    QosLv::AtLeastOnce => stream.write_all(&(PubAck(pkt_id.unwrap()).serialize()?))
+                    QosLv::AtLeastOnce => stream.write_all(&(PubAck(pkt_id.unwrap())
+                        .serialize()?))
                         .and_then(|()| Ok(())),
-                    QosLv::ExactlyOnce => stream.write_all(&(PubRec(pkt_id.unwrap()).serialize()?))
+                    QosLv::ExactlyOnce => stream.write_all(&(PubRec(pkt_id.unwrap())
+                        .serialize()?))
                         .and_then(|()| Ok(()))
                 }
             }
@@ -122,16 +125,18 @@ fn main() {
     let sessions: Arc<RwLock<HashMap<String, Session>>> = Arc::new(RwLock::new(HashMap::new()));
     let retained_msgs: Arc<RwLock<HashMap<String, Message>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let pkt_id_gen: Arc<Mutex<PktIdGen>> = Arc::new(Mutex::new(PktIdGen::new()));
     let th = thread::spawn(move || {
         for stream in listener.incoming() {
             let sessions = Arc::clone(&sessions);
             let retained_msgs = Arc::clone(&retained_msgs);
+            let pkt_id_gen = Arc::clone(&pkt_id_gen);
             match stream {
                 Ok(stream) => {
                     // Make read calls block
                     let _ = stream.set_read_timeout(None).unwrap();
                     thread::spawn(move || {
-                        match handle_client(stream, sessions, retained_msgs) {
+                        match handle_client(stream, sessions, retained_msgs, pkt_id_gen) {
                             Ok(_) => println!("handle_client exited with Ok"),
                             Err(e) => println!("handle_client exited with error: {:?}", e)
                         }

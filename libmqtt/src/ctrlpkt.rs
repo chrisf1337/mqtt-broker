@@ -2,8 +2,11 @@ use std::net::TcpStream;
 use std::io::{Read, Write};
 use std::slice::Iter;
 use std::iter::Iterator;
+use std::sync::{Mutex, Arc};
+use std::u16;
 use error::{Result, Error};
 use uuid::Uuid;
+use pktid::PktIdGen;
 use self::CtrlPkt::*;
 
 pub const MAX_PAYLOAD_SIZE: usize = 268435455;
@@ -90,10 +93,7 @@ pub enum CtrlPkt {
         username: Option<String>,
         password: Option<Vec<u8>>
     },
-    ConnAck {
-        session_present: bool,
-        return_code: ConnAckRetCode
-    },
+    ConnAck { session_present: bool, return_code: ConnAckRetCode },
     Publish {
         dup: bool,
         qos_lv: QosLv,
@@ -106,7 +106,7 @@ pub enum CtrlPkt {
     PubRec(u16),
     PubRel,
     PubComp,
-    Subscribe,
+    Subscribe { id: u16, subscriptions: Vec<(String, QosLv)> },
     SubAck,
     Unsubscribe,
     UnsubAck,
@@ -174,6 +174,14 @@ impl CtrlPkt {
                 let payload = iter.read_len(payload_len)?;
                 Ok(Publish { dup, qos_lv, retain, topic_name, pkt_id, payload })
             }
+            CtrlPktType::Subscribe => {
+                if flags != 0b0010 {
+                    return Err(Error::InvalidFixedHeaderFlags);
+                }
+                // TODO: Wildcard topics
+                let pkt_id = iter.read_u16()?;
+                Ok(Subscribe { id: 0, subscriptions: vec![] })
+            }
             CtrlPktType::PingReq => Ok(PingReq),
             CtrlPktType::Disconnect => Ok(Disconnect),
             pkt_type => Err(Error::UnimplementedPktType(pkt_type))
@@ -194,9 +202,10 @@ impl CtrlPkt {
 
 pub trait MqttWrite: Write {
     fn write_header(&mut self, pkt: &CtrlPkt) -> Result<()>;
-    fn write_remaining_length(&mut self, len: usize) -> Result<()>;
+    fn write_remaining_len(&mut self, len: usize) -> Result<()>;
     fn write_u8(&mut self, i: u8) -> Result<()>;
     fn write_u16(&mut self, i: u16) -> Result<()>;
+    fn write_str(&mut self, s: &str) -> Result<()>;
 }
 
 impl MqttWrite for Vec<u8> {
@@ -204,29 +213,53 @@ impl MqttWrite for Vec<u8> {
         match pkt {
             &ConnAck { session_present, return_code } => {
                 self.write_u8((CtrlPktType::ConnAck as u8) << 4)?;
-                self.write_remaining_length(2)?;
+                self.write_remaining_len(2)?;
                 self.write_u8(session_present as u8)?;
                 self.write_u8(return_code as u8)
             }
             &PingResp => {
                 self.write_u8((CtrlPktType::PingResp as u8) << 4)?;
-                self.write_remaining_length(0)
+                self.write_remaining_len(0)
+            }
+            &Publish { dup, qos_lv, retain, ref topic_name, pkt_id, ref payload } => {
+                let mut low_bits = PublishFlags::empty();
+                if retain {
+                    low_bits |= PublishFlags::RETAIN;
+                }
+                low_bits |= PublishFlags::from_bits_truncate((qos_lv as u8) << 1);
+                if dup {
+                    low_bits |= PublishFlags::DUP;
+                }
+                self.write_u8(((CtrlPktType::Publish as u8) << 4) + PublishFlags::bits(&low_bits))?;
+
+                let topic_name_len = topic_name.as_bytes().len() + 2;
+                let mut remaining_len = topic_name_len + payload.len();
+                // Add 2 for packet id if it exists
+                if pkt_id.is_some() {
+                    remaining_len += 2;
+                }
+                self.write_remaining_len(remaining_len)?;
+                self.write_str(topic_name)?;
+                if pkt_id.is_some() {
+                    self.write_u16(pkt_id.unwrap())?;
+                }
+                Ok(self.write_all(&payload)?)
             }
             &PubAck(id) => {
                 self.write_u8((CtrlPktType::PubAck as u8) << 4)?;
-                self.write_remaining_length(2)?;
+                self.write_remaining_len(2)?;
                 self.write_u16(id)
             }
             &PubRec(id) => {
                 self.write_u8((CtrlPktType::PubRec as u8) << 4)?;
-                self.write_remaining_length(2)?;
+                self.write_remaining_len(2)?;
                 self.write_u16(id)
             }
             pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
     }
 
-    fn write_remaining_length(&mut self, mut len: usize) -> Result<()> {
+    fn write_remaining_len(&mut self, mut len: usize) -> Result<()> {
         let mut done = false;
         while !done {
             let mut encoded_byte = (len % 128) as u8;
@@ -249,6 +282,16 @@ impl MqttWrite for Vec<u8> {
         let lsb = (i | 0x00ff) as u8;
         self.write_u8(msb)?;
         self.write_u8(lsb)
+    }
+
+    fn write_str(&mut self, s: &str) -> Result<()> {
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        if len > (u16::MAX as usize) {
+            return Err(Error::StrTooLong);
+        }
+        self.write_u16(len as u16)?;
+        Ok(self.write_all(bytes)?)
     }
 }
 
