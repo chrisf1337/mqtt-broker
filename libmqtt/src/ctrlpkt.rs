@@ -53,7 +53,7 @@ pub enum CtrlPktType {
     Disconnect = 14
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CtrlPkt {
     Connect {
         connect_flags: ConnectFlags,
@@ -137,8 +137,8 @@ impl CtrlPkt {
                     username,
                     password
                 })
-            }
-            _ => Err(Error::Unimplemented)
+            },
+            pkt_type => Err(Error::UnimplementedPktType(pkt_type))
         }
     }
 
@@ -149,7 +149,7 @@ impl CtrlPkt {
                 buf.write_header(self)?;
                 Ok(buf)
             }
-            _ => Err(Error::Unimplemented)
+            pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
     }
 }
@@ -169,7 +169,7 @@ impl MqttWrite for Vec<u8> {
                 self.write_u8(session_present as u8)?;
                 self.write_u8(return_code as u8)
             }
-            _ => Err(Error::Unimplemented)
+            pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
     }
 

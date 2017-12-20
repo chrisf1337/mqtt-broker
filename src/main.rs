@@ -4,7 +4,7 @@ extern crate mqttc;
 extern crate netopt;
 
 use netopt::{NetworkOptions};
-use mqttc::{ClientOptions};
+use mqttc::{ClientOptions, PubSub};
 use libmqtt::{ctrlpkt::*, ctrlpkt::CtrlPkt::*, error::*};
 use std::collections::hash_map::HashMap;
 use std::sync::{Mutex, Arc};
@@ -92,6 +92,14 @@ fn main() {
     opts.set_username("username".to_string())
         .set_password("password".to_string())
         .set_client_id("".to_string());
-    let _ = opts.connect("127.0.0.1:1883", netopt).expect("Can't connect to server");
+    let mut client = opts.connect("127.0.0.1:1883", netopt).expect("Can't connect to server");
+    loop {
+        match client.await().unwrap() {
+            Some(message) => println!("{:?}", message),
+            None => {
+                println!(".");
+            }
+        }
+    }
     let _ = th.join();
 }

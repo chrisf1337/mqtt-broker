@@ -1,6 +1,7 @@
 use std::result;
 use std::io;
 use std::string;
+use ctrlpkt::{CtrlPkt, CtrlPktType};
 
 pub type Result<T> = result::Result<T, Error>;
 
@@ -16,7 +17,8 @@ pub enum Error {
     UnacceptableProtocolLv,
     IdRejected,
     InvalidWillRetain,
-    Unimplemented,
+    UnimplementedPkt(CtrlPkt),
+    UnimplementedPktType(CtrlPktType),
 
     CloseNetworkConn,
 
