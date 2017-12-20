@@ -1,6 +1,7 @@
 use std::net::TcpStream;
 use std::io::{Read, Write};
 use std::slice::Iter;
+use std::convert::From;
 use std::iter::Iterator;
 use std::u16;
 use error::{Result, Error};
@@ -31,6 +32,33 @@ bitflags! {
         const DUP    = 0b1000;
         const QOS_LV = 0b0110;
         const RETAIN = 0b0001;
+    }
+}
+
+bitflags! {
+    pub struct SubAckFlags: u8 {
+        const MAX_QOS_0 = 0b00000001;
+        const MAX_QOS_1 = 0b00000010;
+        const MAX_QOS_2 = 0b00000011;
+        const FAILURE   = 0b10000000;
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum SubAckRetCode {
+    MaxQos0 = 0,
+    MaxQos1 = 1,
+    MaxQos2 = 2,
+    Failure = 0x80
+}
+
+impl From<QosLv> for SubAckRetCode {
+    fn from(qos_lv: QosLv) -> SubAckRetCode {
+        match qos_lv {
+            QosLv::AtMostOnce => SubAckRetCode::MaxQos0,
+            QosLv::AtLeastOnce => SubAckRetCode::MaxQos1,
+            QosLv::ExactlyOnce => SubAckRetCode::MaxQos2
+        }
     }
 }
 
@@ -104,8 +132,8 @@ pub enum CtrlPkt {
     PubRec(u16),
     PubRel,
     PubComp,
-    Subscribe { pkt_id: u16, subscriptions: Vec<(String, QosLv)> },
-    SubAck,
+    Subscribe { pkt_id: u16, subs: Vec<(String, QosLv)> },
+    SubAck { pkt_id: u16, sub_ack_ret_codes: Vec<SubAckRetCode> },
     Unsubscribe,
     UnsubAck,
     PingReq,
@@ -182,14 +210,10 @@ impl CtrlPkt {
                 if remaining_len <= 2 {
                     return Err(Error::SubscribeMissingTopicFilters);
                 }
-                let mut subscriptions = vec![];
+                let mut subs = vec![];
                 let mut topic_filters_len = 0;
                 while remaining_len - 2 - topic_filters_len > 0 {
                     let (topic_filter, topic_filter_len) = iter.read_str_get_len()?;
-                    // TODO: Wildcard topics. For now, error if topic filter contains a wildcard
-                    if topic_filter.contains("*") {
-                        return Err(Error::Unimplemented("topic filter wildcards".to_string()));
-                    }
                     let requested_qos_byte = iter.read_u8()?;
                     if requested_qos_byte & 0b11111100 > 0 {
                         return Err(Error::SubscribeInvalidRequestedQos);
@@ -197,9 +221,9 @@ impl CtrlPkt {
                     let requested_qos = QosLv::from_int(requested_qos_byte & 0b11)?;
                     // + 1 for requested QoS
                     topic_filters_len += (topic_filter_len as usize) + 1;
-                    subscriptions.push((topic_filter, requested_qos));
+                    subs.push((topic_filter, requested_qos));
                 }
-                Ok(Subscribe { pkt_id, subscriptions })
+                Ok(Subscribe { pkt_id, subs })
             }
             CtrlPktType::PingReq => Ok(PingReq),
             CtrlPktType::Disconnect => Ok(Disconnect),
@@ -209,9 +233,49 @@ impl CtrlPkt {
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = vec![];
+        buf.write_header(self);
         match self {
-            &ConnAck { .. } | &PingResp | &PubAck(..) | &PubRec(..) => {
-                buf.write_header(self)?;
+            &ConnAck { session_present, return_code } => {
+                buf.write_remaining_len(2)?;
+                buf.write_u8(session_present as u8)?;
+                buf.write_u8(return_code as u8)?;
+                Ok(buf)
+            }
+            &PingResp => {
+                buf.write_remaining_len(0)?;
+                Ok(buf)
+            }
+            &Publish { ref topic_name, pkt_id, ref payload, .. } => {
+                let topic_name_len = topic_name.as_bytes().len() + 2;
+                let mut remaining_len = topic_name_len + payload.len();
+                // Add 2 for packet id if it exists
+                if pkt_id.is_some() {
+                    remaining_len += 2;
+                }
+                buf.write_remaining_len(remaining_len)?;
+                buf.write_str(topic_name)?;
+                if pkt_id.is_some() {
+                    buf.write_u16(pkt_id.unwrap())?;
+                }
+                buf.write_all(&payload)?;
+                Ok(buf)
+            }
+            &PubAck(id) => {
+                buf.write_remaining_len(2)?;
+                buf.write_u16(id)?;
+                Ok(buf)
+            }
+            &PubRec(id) => {
+                buf.write_remaining_len(2)?;
+                buf.write_u16(id)?;
+                Ok(buf)
+            }
+            &SubAck { pkt_id, ref sub_ack_ret_codes } => {
+                buf.write_remaining_len(2 + sub_ack_ret_codes.len())?;
+                buf.write_u16(pkt_id)?;
+                for sub_ack in sub_ack_ret_codes {
+                    buf.write_u8(*sub_ack as u8)?;
+                }
                 Ok(buf)
             }
             pkt => Err(Error::UnimplementedPkt(pkt.clone()))
@@ -230,17 +294,13 @@ pub trait MqttWrite: Write {
 impl MqttWrite for Vec<u8> {
     fn write_header(&mut self, pkt: &CtrlPkt) -> Result<()> {
         match pkt {
-            &ConnAck { session_present, return_code } => {
-                self.write_u8((CtrlPktType::ConnAck as u8) << 4)?;
-                self.write_remaining_len(2)?;
-                self.write_u8(session_present as u8)?;
-                self.write_u8(return_code as u8)
+            &ConnAck { .. } => {
+                self.write_u8((CtrlPktType::ConnAck as u8) << 4)
             }
             &PingResp => {
-                self.write_u8((CtrlPktType::PingResp as u8) << 4)?;
-                self.write_remaining_len(0)
+                self.write_u8((CtrlPktType::PingResp as u8) << 4)
             }
-            &Publish { dup, qos_lv, retain, ref topic_name, pkt_id, ref payload } => {
+            &Publish { dup, qos_lv, retain, .. } => {
                 let mut low_bits = PublishFlags::empty();
                 if retain {
                     low_bits |= PublishFlags::RETAIN;
@@ -249,30 +309,16 @@ impl MqttWrite for Vec<u8> {
                 if dup {
                     low_bits |= PublishFlags::DUP;
                 }
-                self.write_u8(((CtrlPktType::Publish as u8) << 4) + PublishFlags::bits(&low_bits))?;
-
-                let topic_name_len = topic_name.as_bytes().len() + 2;
-                let mut remaining_len = topic_name_len + payload.len();
-                // Add 2 for packet id if it exists
-                if pkt_id.is_some() {
-                    remaining_len += 2;
-                }
-                self.write_remaining_len(remaining_len)?;
-                self.write_str(topic_name)?;
-                if pkt_id.is_some() {
-                    self.write_u16(pkt_id.unwrap())?;
-                }
-                Ok(self.write_all(&payload)?)
+                self.write_u8(((CtrlPktType::Publish as u8) << 4) + PublishFlags::bits(&low_bits))
             }
             &PubAck(id) => {
-                self.write_u8((CtrlPktType::PubAck as u8) << 4)?;
-                self.write_remaining_len(2)?;
-                self.write_u16(id)
+                self.write_u8((CtrlPktType::PubAck as u8) << 4)
             }
             &PubRec(id) => {
-                self.write_u8((CtrlPktType::PubRec as u8) << 4)?;
-                self.write_remaining_len(2)?;
-                self.write_u16(id)
+                self.write_u8((CtrlPktType::PubRec as u8) << 4)
+            }
+            &SubAck { .. } => {
+                self.write_u8((CtrlPktType::SubAck as u8) << 4)
             }
             pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
@@ -297,8 +343,8 @@ impl MqttWrite for Vec<u8> {
     }
 
     fn write_u16(&mut self, i: u16) -> Result<()> {
-        let msb = ((i | 0xff00) >> 4) as u8;
-        let lsb = (i | 0x00ff) as u8;
+        let msb = ((i & 0xff00) >> 4) as u8;
+        let lsb = (i & 0x00ff) as u8;
         self.write_u8(msb)?;
         self.write_u8(lsb)
     }
