@@ -17,10 +17,10 @@ pub enum Error {
     UnacceptableProtocolLv,
     IdRejected,
     InvalidWillRetain,
+    InvalidQosLv,
+
     UnimplementedPkt(CtrlPkt),
     UnimplementedPktType(CtrlPktType),
-
-    CloseNetworkConn,
 
     Io(io::Error)
 }

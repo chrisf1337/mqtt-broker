@@ -25,6 +25,14 @@ bitflags! {
     }
 }
 
+bitflags! {
+    pub struct PublishFlags: u8 {
+        const DUP    = 0b1000;
+        const QOS_LV = 0b0110;
+        const RETAIN = 0b0001;
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum ConnAckRetCode {
     Accepted = 0,
@@ -53,6 +61,24 @@ pub enum CtrlPktType {
     Disconnect = 14
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum QosLv {
+    AtMostOnce = 0,
+    AtLeastOnce = 1,
+    ExactlyOnce = 2
+}
+
+impl QosLv {
+    pub fn from_int(i: u8) -> Result<QosLv> {
+        match i {
+            0 => Ok(QosLv::AtMostOnce),
+            1 => Ok(QosLv::AtLeastOnce),
+            2 => Ok(QosLv::ExactlyOnce),
+            _ => Err(Error::InvalidQosLv)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CtrlPkt {
     Connect {
@@ -60,17 +86,24 @@ pub enum CtrlPkt {
         keep_alive: u16,
         client_id: String,
         will_topic: Option<String>,
-        will_message: Option<String>,
+        will_message: Option<Vec<u8>>,
         username: Option<String>,
-        password: Option<String>
+        password: Option<Vec<u8>>
     },
     ConnAck {
         session_present: bool,
         return_code: ConnAckRetCode
     },
-    Publish,
-    PubAck,
-    PubRec,
+    Publish {
+        dup: bool,
+        qos_lv: QosLv,
+        retain: bool,
+        topic_name: String,
+        pkt_id: Option<u16>,
+        payload: Vec<u8>
+    },
+    PubAck(u16),
+    PubRec(u16),
     PubRel,
     PubComp,
     Subscribe,
@@ -85,8 +118,8 @@ pub enum CtrlPkt {
 impl CtrlPkt {
     pub fn deserialize(stream: &mut TcpStream) -> Result<CtrlPkt> {
         let (ty, flags) = stream.read_header()?;
-        let len = stream.read_remaining_len()?;
-        let data = stream.read_len(len)?;
+        let remaining_len = stream.read_remaining_len()?;
+        let data = stream.read_len(remaining_len)?;
         let mut iter = data.iter();
         match ty {
             CtrlPktType::Connect => {
@@ -109,7 +142,7 @@ impl CtrlPkt {
                     client_id = Uuid::new_v4().hyphenated().to_string();
                 };
                 let (will_topic, will_message) = if connect_flags.contains(ConnectFlags::WILL_FLAG) {
-                    (Some(iter.read_str()?), Some(iter.read_str()?))
+                    (Some(iter.read_str()?), Some(iter.read_len_data()?))
                 } else {
                     (None, None)
                 };
@@ -119,25 +152,30 @@ impl CtrlPkt {
                     None
                 };
                 let password = if connect_flags.contains(ConnectFlags::PASSWORD_FLAG) {
-                    Some(iter.read_str()?)
+                    Some(iter.read_len_data()?)
                 } else {
                     None
                 };
-                println!("{} {} {:010b} {} {} {:?} {:?} {:?} {:?}", protocol, protocol_lv,
-                    connect_flags, keep_alive, client_id, will_topic, will_message,
-                    username, password);
-
-                Ok(Connect {
-                    connect_flags,
-                    keep_alive,
-                    client_id,
-                    will_topic,
-                    will_message,
-                    username,
-                    password
-                })
+                Ok(Connect { connect_flags, keep_alive, client_id, will_topic, will_message,
+                    username, password })
+            }
+            CtrlPktType::Publish => {
+                let flags = PublishFlags::from_bits_truncate(flags);
+                let dup = flags.contains(PublishFlags::DUP);
+                let qos_lv = QosLv::from_int((flags | PublishFlags::QOS_LV).bits())?;
+                let retain = flags.contains(PublishFlags::RETAIN);
+                let (topic_name, len) = iter.read_str_get_len()?;
+                let pkt_id = if qos_lv == QosLv::AtLeastOnce || qos_lv == QosLv::ExactlyOnce {
+                    Some(iter.read_u16()?)
+                } else {
+                    None
+                };
+                let payload_len = remaining_len - (len as usize + 2);
+                let payload = iter.read_len(payload_len)?;
+                Ok(Publish { dup, qos_lv, retain, topic_name, pkt_id, payload })
             }
             CtrlPktType::PingReq => Ok(PingReq),
+            CtrlPktType::Disconnect => Ok(Disconnect),
             pkt_type => Err(Error::UnimplementedPktType(pkt_type))
         }
     }
@@ -145,11 +183,7 @@ impl CtrlPkt {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = vec![];
         match self {
-            &ConnAck { session_present, return_code } => {
-                buf.write_header(self)?;
-                Ok(buf)
-            }
-            &PingResp => {
+            &ConnAck { .. } | &PingResp | &PubAck(..) | &PubRec(..) => {
                 buf.write_header(self)?;
                 Ok(buf)
             }
@@ -162,6 +196,7 @@ pub trait MqttWrite: Write {
     fn write_header(&mut self, pkt: &CtrlPkt) -> Result<()>;
     fn write_remaining_length(&mut self, len: usize) -> Result<()>;
     fn write_u8(&mut self, i: u8) -> Result<()>;
+    fn write_u16(&mut self, i: u16) -> Result<()>;
 }
 
 impl MqttWrite for Vec<u8> {
@@ -169,13 +204,23 @@ impl MqttWrite for Vec<u8> {
         match pkt {
             &ConnAck { session_present, return_code } => {
                 self.write_u8((CtrlPktType::ConnAck as u8) << 4)?;
-                self.write_remaining_length(2);
+                self.write_remaining_length(2)?;
                 self.write_u8(session_present as u8)?;
                 self.write_u8(return_code as u8)
             }
             &PingResp => {
                 self.write_u8((CtrlPktType::PingResp as u8) << 4)?;
                 self.write_remaining_length(0)
+            }
+            &PubAck(id) => {
+                self.write_u8((CtrlPktType::PubAck as u8) << 4)?;
+                self.write_remaining_length(2)?;
+                self.write_u16(id)
+            }
+            &PubRec(id) => {
+                self.write_u8((CtrlPktType::PubRec as u8) << 4)?;
+                self.write_remaining_length(2)?;
+                self.write_u16(id)
             }
             pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
@@ -189,7 +234,7 @@ impl MqttWrite for Vec<u8> {
             if len > 0 {
                 encoded_byte = encoded_byte | 128;
             }
-            self.write_u8(encoded_byte);
+            self.write_u8(encoded_byte)?;
             done = len == 0;
         }
         Ok(())
@@ -197,6 +242,13 @@ impl MqttWrite for Vec<u8> {
 
     fn write_u8(&mut self, i: u8) -> Result<()> {
         Ok(self.write_all(&[i])?)
+    }
+
+    fn write_u16(&mut self, i: u16) -> Result<()> {
+        let msb = ((i | 0xff00) >> 4) as u8;
+        let lsb = (i | 0x00ff) as u8;
+        self.write_u8(msb)?;
+        self.write_u8(lsb)
     }
 }
 
@@ -208,8 +260,10 @@ pub trait MqttRead: Read {
 
 pub trait MqttReadIterator: Iterator {
     fn read_str(&mut self) -> Result<String>;
+    fn read_str_get_len(&mut self) -> Result<(String, u16)>;
     fn read_protocol_lv(&mut self) -> Result<u8>;
     fn read_len(&mut self, len: usize) -> Result<Vec<u8>>;
+    fn read_len_data(&mut self) -> Result<Vec<u8>>;
     fn read_u8(&mut self) -> Result<u8>;
     fn read_u16(&mut self) -> Result<u16>;
 }
@@ -264,9 +318,13 @@ impl MqttRead for TcpStream {
 
 impl<'a> MqttReadIterator for Iter<'a, u8> {
     fn read_str(&mut self) -> Result<String> {
-        let len = self.read_u16()? as usize;
-        let str_buf = self.read_len(len)?;
-        Ok(String::from_utf8(str_buf)?)
+        Ok(self.read_str_get_len()?.0)
+    }
+
+    fn read_str_get_len(&mut self) -> Result<(String, u16)> {
+        let len = self.read_u16()?;
+        let str_buf = self.read_len(len as usize)?;
+        Ok((String::from_utf8(str_buf)?, len + 2))
     }
 
     fn read_len(&mut self, len: usize) -> Result<Vec<u8>> {
@@ -275,6 +333,11 @@ impl<'a> MqttReadIterator for Iter<'a, u8> {
             buf.push(*self.next().ok_or(Error::ReadErr)?);
         }
         Ok(buf)
+    }
+
+    fn read_len_data(&mut self) -> Result<Vec<u8>> {
+        let len = self.read_u16()?;
+        self.read_len(len as usize)
     }
 
     fn read_protocol_lv(&mut self) -> Result<u8> {
