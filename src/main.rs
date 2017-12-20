@@ -2,6 +2,7 @@
 extern crate libmqtt;
 extern crate mqttc;
 extern crate netopt;
+extern crate mqtt3;
 
 use netopt::{NetworkOptions};
 use mqttc::{ClientOptions, PubSub, PubOpt};
@@ -284,6 +285,14 @@ fn handle_client(mut stream: TcpStream,
     }
 }
 
+fn msg_get_payload(msg: &mqtt3::Message) -> String {
+    let mut v = vec![];
+    for c in msg.payload.iter() {
+        v.push(*c);
+    }
+    String::from_utf8(v).unwrap()
+}
+
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:1883").unwrap();
     let sessions: Arc<RwLock<HashMap<String, Session>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -332,6 +341,7 @@ fn main() {
             match client.await().unwrap() {
                 Some(message) => {
                     println!("client 1: {:?}", message);
+                    println!("client 1: {:?}", msg_get_payload(&message));
                 },
                 None => {
                     println!(".");
@@ -355,6 +365,7 @@ fn main() {
             match client.await().unwrap() {
                 Some(message) => {
                     println!("client 2: {:?}", message);
+                    println!("client 2: {:?}", msg_get_payload(&message));
                 },
                 None => {
                     println!(".");
