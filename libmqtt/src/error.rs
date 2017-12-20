@@ -8,7 +8,7 @@ pub type Result<T> = result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     PayloadTooLong,
-    InvalidControlPacketType,
+    InvalidControlPacketType(u8),
     MalformedRemainingLen,
     FromUtf8Err,
     MalformedUtf8Str,

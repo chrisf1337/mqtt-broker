@@ -85,12 +85,11 @@ pub enum CtrlPkt {
 impl CtrlPkt {
     pub fn deserialize(stream: &mut TcpStream) -> Result<CtrlPkt> {
         let (ty, flags) = stream.read_header()?;
+        let len = stream.read_remaining_len()?;
+        let data = stream.read_len(len)?;
+        let mut iter = data.iter();
         match ty {
             CtrlPktType::Connect => {
-                let len = stream.read_remaining_len()?;
-                let data = stream.read_len(len)?;
-                let mut iter = data.iter();
-
                 let protocol = iter.read_str()?;
                 if protocol != "MQTT" {
                     return Err(Error::InvalidProtocol);
@@ -137,7 +136,8 @@ impl CtrlPkt {
                     username,
                     password
                 })
-            },
+            }
+            CtrlPktType::PingReq => Ok(PingReq),
             pkt_type => Err(Error::UnimplementedPktType(pkt_type))
         }
     }
@@ -149,6 +149,10 @@ impl CtrlPkt {
                 buf.write_header(self)?;
                 Ok(buf)
             }
+            &PingResp => {
+                buf.write_header(self)?;
+                Ok(buf)
+            }
             pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
     }
@@ -156,7 +160,7 @@ impl CtrlPkt {
 
 pub trait MqttWrite: Write {
     fn write_header(&mut self, pkt: &CtrlPkt) -> Result<()>;
-    fn write_remaining_length(&mut self, len: usize);
+    fn write_remaining_length(&mut self, len: usize) -> Result<()>;
     fn write_u8(&mut self, i: u8) -> Result<()>;
 }
 
@@ -169,11 +173,15 @@ impl MqttWrite for Vec<u8> {
                 self.write_u8(session_present as u8)?;
                 self.write_u8(return_code as u8)
             }
+            &PingResp => {
+                self.write_u8((CtrlPktType::PingResp as u8) << 4)?;
+                self.write_remaining_length(0)
+            }
             pkt => Err(Error::UnimplementedPkt(pkt.clone()))
         }
     }
 
-    fn write_remaining_length(&mut self, mut len: usize) {
+    fn write_remaining_length(&mut self, mut len: usize) -> Result<()> {
         let mut done = false;
         while !done {
             let mut encoded_byte = (len % 128) as u8;
@@ -184,6 +192,7 @@ impl MqttWrite for Vec<u8> {
             self.write_u8(encoded_byte);
             done = len == 0;
         }
+        Ok(())
     }
 
     fn write_u8(&mut self, i: u8) -> Result<()> {
@@ -208,6 +217,7 @@ pub trait MqttReadIterator: Iterator {
 impl MqttRead for TcpStream {
     fn read_header(&mut self) -> Result<(CtrlPktType, u8)> {
         let header = try!(self.read_len(1));
+        println!("header: {:#010b}", header[0]);
         let ty = try!(match header[0] >> 4 {
             1 => Ok(CtrlPktType::Connect),
             2 => Ok(CtrlPktType::ConnAck),
@@ -223,7 +233,7 @@ impl MqttRead for TcpStream {
             12 => Ok(CtrlPktType::PingReq),
             13 => Ok(CtrlPktType::PingResp),
             14 => Ok(CtrlPktType::Disconnect),
-            _ => Err(Error::InvalidControlPacketType)
+            i => Err(Error::InvalidControlPacketType(i))
         });
         let flags = header[0] & 0x0f;
         Ok((ty, flags))

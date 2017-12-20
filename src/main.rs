@@ -37,7 +37,11 @@ fn handle_client(mut stream: TcpStream, sessions: Arc<Mutex<HashMap<String, Sess
                         };
                 let buf = CtrlPkt::ConnAck { session_present, return_code }.serialize()?;
                 stream.write_all(&buf)?;
-            },
+            }
+            Ok(PingReq) => {
+                println!("received PingReq");
+                stream.write_all(&(PingResp.serialize()?))?
+            }
             Err(Error::InvalidProtocol) => {
                 stream.write_all(&(CtrlPkt::ConnAck {
                     session_present: false,
@@ -91,7 +95,8 @@ fn main() {
     let mut opts = ClientOptions::new();
     opts.set_username("username".to_string())
         .set_password("password".to_string())
-        .set_client_id("".to_string());
+        .set_client_id("".to_string())
+        .set_keep_alive(1);
     let mut client = opts.connect("127.0.0.1:1883", netopt).expect("Can't connect to server");
     loop {
         match client.await().unwrap() {
